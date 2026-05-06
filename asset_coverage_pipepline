@@ -1,0 +1,579 @@
+"""
+Asset Coverage Pipeline
+=======================
+Pulls asset coverage data from ServiceNow via OAuth, pushes a daily
+Power BI dataset refresh, and ships structured logs to Splunk HEC.
+Failures surface as alerts — nothing drops silently.
+
+Run modes
+---------
+  python asset_coverage_pipeline.py            # live (needs real creds in env)
+  python asset_coverage_pipeline.py --dry-run  # simulated, no network calls
+  python asset_coverage_pipeline.py --once     # run now, skip scheduler
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import datetime, timezone
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Any
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+UTC = timezone.utc
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Config:
+    # ServiceNow
+    snow_instance:      str = field(default_factory=lambda: env("SNOW_INSTANCE", "demo.service-now.com"))
+    snow_client_id:     str = field(default_factory=lambda: env("SNOW_CLIENT_ID", "demo_client_id"))
+    snow_client_secret: str = field(default_factory=lambda: env("SNOW_CLIENT_SECRET", "demo_secret"))
+    snow_table:         str = "cmdb_ci"          # Configuration Items / assets
+
+    # Power BI
+    pbi_tenant_id:      str = field(default_factory=lambda: env("PBI_TENANT_ID", "demo_tenant"))
+    pbi_client_id:      str = field(default_factory=lambda: env("PBI_CLIENT_ID", "demo_pbi_client"))
+    pbi_client_secret:  str = field(default_factory=lambda: env("PBI_CLIENT_SECRET", "demo_pbi_secret"))
+    pbi_workspace_id:   str = field(default_factory=lambda: env("PBI_WORKSPACE_ID", "demo_workspace"))
+    pbi_dataset_id:     str = field(default_factory=lambda: env("PBI_DATASET_ID", "demo_dataset"))
+
+    # Splunk HEC
+    splunk_hec_url:     str = field(default_factory=lambda: env("SPLUNK_HEC_URL", "https://splunk.internal:8088/services/collector"))
+    splunk_hec_token:   str = field(default_factory=lambda: env("SPLUNK_HEC_TOKEN", "demo_hec_token"))
+    splunk_index:       str = field(default_factory=lambda: env("SPLUNK_INDEX", "asset_pipeline"))
+    splunk_source:      str = "asset_coverage_pipeline"
+
+    # Retry
+    max_retries:        int = 3
+    retry_backoff_sec:  float = 2.0   # doubles each attempt
+
+    # Scheduler
+    schedule_interval_sec: int = 86_400   # 24 h
+
+
+# ── Structured Splunk Logger ──────────────────────────────────────────────────
+
+class SplunkHandler(logging.Handler):
+    """
+    Ships log records as JSON events to Splunk HTTP Event Collector (HEC).
+    Falls back to stderr on transport failure so logs are never lost.
+    """
+
+    def __init__(self, cfg: Config, dry_run: bool = False):
+        super().__init__()
+        self.cfg = cfg
+        self.dry_run = dry_run
+
+    def emit(self, record: logging.LogRecord) -> None:
+        payload = {
+            "time":       record.created,
+            "host":       "pipeline-host",
+            "source":     self.cfg.splunk_source,
+            "index":      self.cfg.splunk_index,
+            "sourcetype": "json",
+            "event": {
+                "level":    record.levelname,
+                "message":  record.getMessage(),
+                "logger":   record.name,
+                "ts":       datetime.fromtimestamp(record.created, UTC).isoformat(),
+                **(record.__dict__.get("extra_fields", {})),
+            },
+        }
+
+        if self.dry_run:
+            # In dry-run just print the structured event so the interviewer can see it
+            print(f"[SPLUNK-DRY-RUN] {json.dumps(payload['event'])}", file=sys.stderr)
+            return
+
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            self.cfg.splunk_hec_url,
+            data=body,
+            headers={
+                "Authorization": f"Splunk {self.cfg.splunk_hec_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as exc:  # never let log transport crash the pipeline
+            print(f"[SPLUNK-TRANSPORT-ERROR] {exc}", file=sys.stderr)
+
+
+def build_logger(cfg: Config, dry_run: bool) -> logging.Logger:
+    log = logging.getLogger("asset_pipeline")
+    log.setLevel(logging.DEBUG)
+
+    # Human-readable console output
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    log.addHandler(console)
+
+    # Structured Splunk output
+    log.addHandler(SplunkHandler(cfg, dry_run=dry_run))
+    return log
+
+
+def log_event(log: logging.Logger, level: str, message: str, **fields) -> None:
+    """Log with arbitrary structured fields that land in Splunk as JSON keys."""
+    record = logging.LogRecord(
+        name="asset_pipeline", level=getattr(logging, level),
+        pathname="", lineno=0, msg=message, args=(), exc_info=None,
+    )
+    record.extra_fields = fields
+    log.handle(record)
+
+
+# ── Retry Decorator ───────────────────────────────────────────────────────────
+
+def with_retries(
+    fn,
+    *,
+    max_retries: int,
+    backoff: float,
+    log: logging.Logger,
+    label: str,
+    dry_run: bool = False,
+):
+    """
+    Calls fn() up to max_retries times with exponential backoff.
+    Raises the last exception if all attempts fail so the caller
+    can alert instead of silently continuing.
+    """
+    delay = backoff
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            log_event(
+                log, "WARNING",
+                f"{label} — attempt {attempt}/{max_retries} failed: {exc}",
+                label=label, attempt=attempt, max_retries=max_retries,
+                error=str(exc),
+            )
+            if attempt < max_retries:
+                log.info("%s — retrying in %.0fs", label, delay)
+                if not dry_run:
+                    time.sleep(delay)
+                delay *= 2
+
+    raise RuntimeError(f"{label} failed after {max_retries} attempts") from last_exc
+
+
+# ── ServiceNow OAuth Client ───────────────────────────────────────────────────
+
+class ServiceNowClient:
+    """
+    Authenticates via OAuth 2.0 client-credentials and fetches CMDB asset
+    coverage records.  Token is cached and reused until expiry.
+    """
+
+    TOKEN_URL = "https://{instance}/oauth_token.do"
+
+    def __init__(self, cfg: Config, log: logging.Logger, dry_run: bool = False):
+        self.cfg = cfg
+        self.log = log
+        self.dry_run = dry_run
+        self._token: Optional[str] = None
+        self._token_expires: float = 0.0
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
+
+    def _fetch_token(self) -> str:
+        if self.dry_run:
+            self.log.debug("DRY-RUN | Skipping ServiceNow OAuth — using mock token")
+            return "mock_snow_token"
+
+        url = self.TOKEN_URL.format(instance=self.cfg.snow_instance)
+        body = urllib.parse.urlencode({
+            "grant_type":    "client_credentials",
+            "client_id":     self.cfg.snow_client_id,
+            "client_secret": self.cfg.snow_client_secret,
+        }).encode()
+
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+
+        self._token_expires = time.time() + data.get("expires_in", 1800) - 60
+        return data["access_token"]
+
+    def _token_valid(self) -> bool:
+        return self._token is not None and time.time() < self._token_expires
+
+    def get_token(self) -> str:
+        if not self._token_valid():
+            log_event(self.log, "INFO", "Refreshing ServiceNow OAuth token",
+                      instance=self.cfg.snow_instance)
+            self._token = self._fetch_token()
+        return self._token
+
+    # ── Asset Coverage Query ──────────────────────────────────────────────────
+
+    def fetch_asset_coverage(self) -> list[dict]:
+        """
+        Pulls active CIs with their coverage classification.
+        In production: add sysparm_query for business unit / env filters.
+        """
+        if self.dry_run:
+            return self._mock_assets()
+
+        token  = self.get_token()
+        params = urllib.parse.urlencode({
+            "sysparm_fields":  "sys_id,name,asset_tag,operational_status,managed_by,u_coverage_tier",
+            "sysparm_query":   "operational_status=1",   # In service only
+            "sysparm_limit":   "1000",
+            "sysparm_display_value": "true",
+        })
+        url = f"https://{self.cfg.snow_instance}/api/now/table/{self.cfg.snow_table}?{params}"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read()).get("result", [])
+
+    @staticmethod
+    def _mock_assets() -> list[dict]:
+        tiers = ["Gold", "Silver", "Bronze", "Unclassified"]
+        owners = ["risk-team", "trading-desk", "infra", "regulatory"]
+        return [
+            {
+                "sys_id":            f"SYS{i:05d}",
+                "name":              f"ASSET-{i:04d}",
+                "asset_tag":         f"TAG-{i:06d}",
+                "operational_status": "In Service",
+                "managed_by":        owners[i % len(owners)],
+                "u_coverage_tier":   tiers[i % len(tiers)],
+            }
+            for i in range(1, 251)   # 250 simulated assets
+        ]
+
+
+# ── Power BI Refresh Client ───────────────────────────────────────────────────
+
+class PowerBIClient:
+    """
+    Authenticates against Azure AD and triggers a Power BI dataset refresh.
+    Polls until the refresh completes or times out.
+    """
+
+    TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    REFRESH_URL = (
+        "https://api.powerbi.com/v1.0/myorg/groups/{workspace}/datasets/{dataset}/refreshes"
+    )
+    STATUS_URL = REFRESH_URL + "/{refresh_id}"
+
+    def __init__(self, cfg: Config, log: logging.Logger, dry_run: bool = False):
+        self.cfg = cfg
+        self.log = log
+        self.dry_run = dry_run
+        self._token: Optional[str] = None
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
+
+    def _fetch_token(self) -> str:
+        if self.dry_run:
+            return "mock_pbi_token"
+
+        url  = self.TOKEN_URL.format(tenant=self.cfg.pbi_tenant_id)
+        body = urllib.parse.urlencode({
+            "grant_type":    "client_credentials",
+            "client_id":     self.cfg.pbi_client_id,
+            "client_secret": self.cfg.pbi_client_secret,
+            "scope":         "https://analysis.windows.net/powerbi/api/.default",
+        }).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())["access_token"]
+
+    def _auth_headers(self) -> dict:
+        if not self._token:
+            self._token = self._fetch_token()
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type":  "application/json",
+        }
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+
+    def trigger_refresh(self) -> str:
+        """POSTs a refresh request; returns the refresh ID from the Location header."""
+        if self.dry_run:
+            mock_id = "mock-refresh-001"
+            self.log.debug("DRY-RUN | Simulating Power BI refresh — id=%s", mock_id)
+            return mock_id
+
+        url = self.REFRESH_URL.format(
+            workspace=self.cfg.pbi_workspace_id,
+            dataset=self.cfg.pbi_dataset_id,
+        )
+        req = urllib.request.Request(
+            url, data=b"{}", headers=self._auth_headers(), method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            location = resp.headers.get("Location", "")
+            # Location: .../refreshes/<refresh_id>
+            return location.rstrip("/").split("/")[-1]
+
+    def poll_refresh(self, refresh_id: str, timeout_sec: int = 300) -> str:
+        """
+        Polls the refresh status until completion.
+        Returns final status: 'Completed' | 'Failed' | 'Cancelled'.
+        """
+        if self.dry_run:
+            self.log.debug("DRY-RUN | Simulating Power BI poll — returning Completed")
+            time.sleep(0.1)
+            return "Completed"
+
+        url = self.STATUS_URL.format(
+            workspace=self.cfg.pbi_workspace_id,
+            dataset=self.cfg.pbi_dataset_id,
+            refresh_id=refresh_id,
+        )
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            req = urllib.request.Request(url, headers=self._auth_headers())
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            status = data.get("status", "Unknown")
+            if status not in ("Unknown", "InProgress"):
+                return status
+            time.sleep(15)
+
+        return "Timeout"
+
+
+# ── Asset Coverage Report ─────────────────────────────────────────────────────
+
+def build_coverage_summary(assets: list[dict]) -> dict:
+    """Aggregates raw CMDB records into coverage metrics for Power BI."""
+    total = len(assets)
+    by_tier: dict[str, int] = {}
+    by_owner: dict[str, int] = {}
+    unclassified = 0
+
+    for a in assets:
+        tier  = a.get("u_coverage_tier", "Unclassified") or "Unclassified"
+        owner = a.get("managed_by", "Unknown") or "Unknown"
+        by_tier[tier]   = by_tier.get(tier, 0) + 1
+        by_owner[owner] = by_owner.get(owner, 0) + 1
+        if tier == "Unclassified":
+            unclassified += 1
+
+    coverage_pct = round((total - unclassified) / max(total, 1) * 100, 1)
+
+    return {
+        "total_assets":   total,
+        "coverage_pct":   coverage_pct,
+        "unclassified":   unclassified,
+        "by_tier":        by_tier,
+        "by_owner":       by_owner,
+        "run_ts":         utcnow().isoformat(),
+    }
+
+
+# ── Pipeline Orchestrator ─────────────────────────────────────────────────────
+
+class AssetCoveragePipeline:
+    def __init__(self, cfg: Config, log: logging.Logger, dry_run: bool):
+        self.cfg    = cfg
+        self.log    = log
+        self.dry_run = dry_run
+        self.snow   = ServiceNowClient(cfg, log, dry_run)
+        self.pbi    = PowerBIClient(cfg, log, dry_run)
+
+    def run(self) -> bool:
+        """
+        Execute one pipeline run.  Returns True on success, False on failure.
+        All failures are logged with structured fields before raising — never
+        dropped silently.
+        """
+        run_id = utcnow().strftime("%Y%m%dT%H%M%SZ")
+        log_event(self.log, "INFO", "Pipeline run starting",
+                  run_id=run_id, dry_run=self.dry_run)
+
+        start = time.time()
+
+        # ── Step 1: Pull assets from ServiceNow (with retries) ────────────────
+        try:
+            assets = with_retries(
+                self.snow.fetch_asset_coverage,
+                max_retries=self.cfg.max_retries,
+                backoff=self.cfg.retry_backoff_sec,
+                log=self.log,
+                label="ServiceNow asset fetch",
+                dry_run=self.dry_run,
+            )
+        except RuntimeError as exc:
+            log_event(self.log, "ERROR",
+                      "ALERT: ServiceNow fetch failed — Power BI not refreshed",
+                      run_id=run_id, error=str(exc), step="snow_fetch",
+                      alert=True)
+            return False
+
+        summary = build_coverage_summary(assets)
+        log_event(self.log, "INFO", "Asset coverage pulled",
+                  run_id=run_id,
+                  total_assets=summary["total_assets"],
+                  coverage_pct=summary["coverage_pct"],
+                  unclassified=summary["unclassified"],
+                  by_tier=summary["by_tier"])
+
+        # ── Step 2: Trigger Power BI refresh (with retries) ───────────────────
+        try:
+            refresh_id = with_retries(
+                self.pbi.trigger_refresh,
+                max_retries=self.cfg.max_retries,
+                backoff=self.cfg.retry_backoff_sec,
+                log=self.log,
+                label="Power BI refresh trigger",
+                dry_run=self.dry_run,
+            )
+        except RuntimeError as exc:
+            log_event(self.log, "ERROR",
+                      "ALERT: Power BI refresh trigger failed",
+                      run_id=run_id, error=str(exc), step="pbi_trigger",
+                      alert=True)
+            return False
+
+        log_event(self.log, "INFO", "Power BI refresh triggered",
+                  run_id=run_id, refresh_id=refresh_id,
+                  workspace=self.cfg.pbi_workspace_id,
+                  dataset=self.cfg.pbi_dataset_id)
+
+        # ── Step 3: Poll until refresh completes ──────────────────────────────
+        try:
+            status = with_retries(
+                lambda: self.pbi.poll_refresh(refresh_id),
+                max_retries=self.cfg.max_retries,
+                backoff=self.cfg.retry_backoff_sec,
+                log=self.log,
+                label="Power BI refresh poll",
+                dry_run=self.dry_run,
+            )
+        except RuntimeError as exc:
+            log_event(self.log, "ERROR",
+                      "ALERT: Power BI refresh poll failed",
+                      run_id=run_id, error=str(exc), step="pbi_poll",
+                      alert=True)
+            return False
+
+        elapsed = round(time.time() - start, 1)
+
+        if status != "Completed":
+            log_event(self.log, "ERROR",
+                      f"ALERT: Power BI refresh ended with status '{status}'",
+                      run_id=run_id, refresh_id=refresh_id,
+                      pbi_status=status, elapsed_sec=elapsed,
+                      alert=True)
+            return False
+
+        log_event(self.log, "INFO", "Pipeline run completed successfully",
+                  run_id=run_id, pbi_status=status,
+                  elapsed_sec=elapsed,
+                  total_assets=summary["total_assets"],
+                  coverage_pct=summary["coverage_pct"])
+
+        self._print_summary(summary)
+        return True
+
+    @staticmethod
+    def _print_summary(summary: dict) -> None:
+        print("\n" + "=" * 56)
+        print("  ASSET COVERAGE SUMMARY")
+        print(f"  Run: {summary['run_ts']}")
+        print("=" * 56)
+        print(f"  Total assets    : {summary['total_assets']}")
+        print(f"  Coverage        : {summary['coverage_pct']}%")
+        print(f"  Unclassified    : {summary['unclassified']}")
+        print()
+        print("  By Tier:")
+        for tier, count in sorted(summary["by_tier"].items()):
+            bar = "#" * (count // 5)
+            print(f"    {tier:<15} {count:>4}  {bar}")
+        print()
+        print("  By Owner:")
+        for owner, count in sorted(summary["by_owner"].items()):
+            print(f"    {owner:<15} {count:>4}")
+        print("=" * 56 + "\n")
+
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+
+class Scheduler:
+    """
+    Runs the pipeline on a fixed interval (default 24 h).
+    Designed to run as a long-lived process under systemd / a container.
+    """
+
+    def __init__(self, pipeline: AssetCoveragePipeline, interval_sec: int,
+                 log: logging.Logger):
+        self.pipeline    = pipeline
+        self.interval    = interval_sec
+        self.log         = log
+
+    def run_forever(self) -> None:
+        log_event(self.log, "INFO", "Scheduler started",
+                  interval_sec=self.interval)
+        while True:
+            success = self.pipeline.run()
+            if not success:
+                log_event(self.log, "WARNING",
+                          "Pipeline run failed — will retry next interval",
+                          next_run_in_sec=self.interval)
+            self.log.info("Next run in %s hours", self.interval // 3600)
+            time.sleep(self.interval)
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Asset Coverage Pipeline")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate all API calls — no network required")
+    parser.add_argument("--once", action="store_true",
+                        help="Run once and exit (skip scheduler)")
+    args = parser.parse_args()
+
+    cfg = Config()
+    log = build_logger(cfg, dry_run=args.dry_run)
+
+    if args.dry_run:
+        log.info("DRY-RUN mode — no real API calls will be made")
+
+    pipeline = AssetCoveragePipeline(cfg, log, dry_run=args.dry_run)
+
+    if args.once or args.dry_run:
+        success = pipeline.run()
+        sys.exit(0 if success else 1)
+    else:
+        scheduler = Scheduler(pipeline, cfg.schedule_interval_sec, log)
+        scheduler.run_forever()
+
+
+if __name__ == "__main__":
+    main()
