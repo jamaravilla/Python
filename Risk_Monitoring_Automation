@@ -1,0 +1,509 @@
+"""
+Risk Application Monitoring & Automation System
+================================================
+Demonstrates automation of monitoring workflows for risk applications:
+- Feed/snapshot availability monitoring (reduces manual checks)
+- SLA breach detection and alerting
+- System health checks across multiple services
+- Incident classification and triage
+- Automated reporting for stakeholders
+- Release management tracking
+"""
+
+import time
+import random
+import logging
+import json
+from datetime import datetime, timedelta, timezone
+
+UTC = timezone.utc
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+from collections import defaultdict
+
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+class Severity(Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+class FeedStatus(Enum):
+    OK = "OK"
+    DELAYED = "DELAYED"
+    MISSING = "MISSING"
+    STALE = "STALE"
+
+
+class SLATier(Enum):
+    """Response SLA tiers aligned with support agreements."""
+    P1 = 15    # Critical — 15-minute response
+    P2 = 60    # High     — 1-hour response
+    P3 = 240   # Medium   — 4-hour response
+    P4 = 1440  # Low      — next business day
+
+
+# ── Data Models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class Feed:
+    name: str
+    system: str          # e.g. "Risk Engine", "Market Data", "Regulatory"
+    expected_by: str     # HH:MM UTC
+    max_staleness_min: int = 30
+    last_received: Optional[datetime] = None
+    status: FeedStatus = FeedStatus.MISSING
+
+
+@dataclass
+class Incident:
+    id: str
+    title: str
+    system: str
+    severity: Severity
+    sla_tier: SLATier
+    opened_at: datetime = field(default_factory=utcnow)
+    resolved_at: Optional[datetime] = None
+    owner: Optional[str] = None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def age_minutes(self) -> float:
+        end = self.resolved_at or utcnow()
+        return (end - self.opened_at).total_seconds() / 60
+
+    @property
+    def sla_breached(self) -> bool:
+        return self.age_minutes > self.sla_tier.value and self.resolved_at is None
+
+    @property
+    def time_to_sla_breach_min(self) -> float:
+        remaining = self.sla_tier.value - self.age_minutes
+        return max(remaining, 0)
+
+
+@dataclass
+class ServiceHealth:
+    name: str
+    healthy: bool
+    response_ms: float
+    last_checked: datetime = field(default_factory=utcnow)
+    error: Optional[str] = None
+
+
+# ── Feed Monitor ──────────────────────────────────────────────────────────────
+
+class FeedMonitor:
+    """
+    Replaces manual checks of whether risk data feeds have arrived on time.
+    Covers traded products, risk snapshots, and regulatory submissions.
+    """
+
+    def __init__(self):
+        self.feeds: list[Feed] = self._register_feeds()
+        self._missing_alerts_sent: set[str] = set()
+
+    def _register_feeds(self) -> list[Feed]:
+        return [
+            Feed("EOD_PnL_AMRS",         "Risk Engine",   "21:00", max_staleness_min=30),
+            Feed("EOD_PnL_EMEA",         "Risk Engine",   "06:00", max_staleness_min=30),
+            Feed("RegulatoryReport_FCA",  "Regulatory",    "07:30", max_staleness_min=15),
+            Feed("RegulatoryReport_SEC",  "Regulatory",    "20:00", max_staleness_min=15),
+            Feed("MarketData_Snapshot",   "Market Data",   "08:00", max_staleness_min=10),
+            Feed("VaR_Snapshot_AMRS",     "Risk Engine",   "22:00", max_staleness_min=45),
+            Feed("VaR_Snapshot_EMEA",     "Risk Engine",   "07:00", max_staleness_min=45),
+            Feed("TraderBlotter_Feed",    "Traded Products","continuous", max_staleness_min=5),
+            Feed("CreditRisk_Daily",      "Risk Engine",   "09:00", max_staleness_min=60),
+        ]
+
+    def simulate_feed_poll(self) -> list[Feed]:
+        """Simulates polling feed arrival status (replace with real DB/API calls)."""
+        now = utcnow()
+        for feed in self.feeds:
+            roll = random.random()
+            if roll > 0.15:                           # 85 % on-time
+                feed.last_received = now - timedelta(minutes=random.randint(0, 5))
+                feed.status = FeedStatus.OK
+            elif roll > 0.07:                         # 8 % delayed
+                feed.last_received = now - timedelta(minutes=random.randint(feed.max_staleness_min, 90))
+                feed.status = FeedStatus.DELAYED
+            else:                                     # 7 % missing
+                feed.last_received = None
+                feed.status = FeedStatus.MISSING
+        return self.feeds
+
+    def get_problem_feeds(self) -> list[Feed]:
+        return [f for f in self.feeds if f.status != FeedStatus.OK]
+
+    def auto_remediate(self, feed: Feed) -> bool:
+        """
+        Attempt automated remediation before raising a manual incident.
+        Returns True if remediation was triggered.
+        """
+        if feed.status == FeedStatus.MISSING and feed.name not in self._missing_alerts_sent:
+            log.warning(
+                "AUTO-REMEDIATE | Feed '%s' (%s) is MISSING — triggering reload job.",
+                feed.name, feed.system,
+            )
+            # In production: call job scheduler / REST API to re-trigger the feed
+            self._missing_alerts_sent.add(feed.name)
+            return True
+        if feed.status == FeedStatus.DELAYED:
+            log.info(
+                "AUTO-REMEDIATE | Feed '%s' delayed — notifying downstream consumers.",
+                feed.name,
+            )
+            return True
+        return False
+
+
+# ── Service Health Checker ────────────────────────────────────────────────────
+
+class ServiceHealthChecker:
+    """Polls critical risk services and surfaces degradation before users report it."""
+
+    SERVICES = [
+        "RiskEngine-API",
+        "MarketDataGateway",
+        "RegulatorySubmission",
+        "TradedProductsUI",
+        "RiskReportingPortal",
+        "PositionKeeping-DB",
+        "AlertingService",
+    ]
+
+    def check_all(self) -> list[ServiceHealth]:
+        results = []
+        for svc in self.SERVICES:
+            healthy = random.random() > 0.12          # 88 % chance healthy
+            latency = random.uniform(10, 80) if healthy else random.uniform(800, 3000)
+            error = None if healthy else random.choice([
+                "Connection timeout",
+                "HTTP 503 Service Unavailable",
+                "Database connection pool exhausted",
+                "TLS handshake failed",
+            ])
+            results.append(ServiceHealth(svc, healthy, round(latency, 1), error=error))
+        return results
+
+    def degraded_services(self, results: list[ServiceHealth]) -> list[ServiceHealth]:
+        return [r for r in results if not r.healthy]
+
+
+# ── Incident Manager ──────────────────────────────────────────────────────────
+
+class IncidentManager:
+    """
+    Tracks open incidents, enforces SLA timers, and classifies severity
+    so first-line support can triage without manual spreadsheets.
+    """
+
+    def __init__(self):
+        self._incidents: dict[str, Incident] = {}
+        self._counter = 0
+
+    def open(self, title: str, system: str, severity: Severity) -> Incident:
+        self._counter += 1
+        inc_id = f"INC{self._counter:05d}"
+        tier = self._map_severity_to_sla(severity)
+        inc = Incident(inc_id, title, system, severity, tier)
+        self._incidents[inc_id] = inc
+        log.warning(
+            "INCIDENT OPENED | %s | [%s] %s | SLA: %d min",
+            inc_id, severity.value, title, tier.value,
+        )
+        return inc
+
+    def resolve(self, inc_id: str, resolution_note: str) -> Optional[Incident]:
+        inc = self._incidents.get(inc_id)
+        if not inc:
+            log.error("Incident %s not found.", inc_id)
+            return None
+        inc.resolved_at = utcnow()
+        inc.notes.append(f"RESOLVED: {resolution_note}")
+        log.info(
+            "INCIDENT RESOLVED | %s | duration %.1f min | SLA breached: %s",
+            inc_id, inc.age_minutes, inc.sla_breached,
+        )
+        return inc
+
+    def check_sla_breaches(self) -> list[Incident]:
+        breached = [i for i in self._incidents.values() if i.sla_breached]
+        for inc in breached:
+            log.critical(
+                "SLA BREACH | %s | [%s] %s | overdue by %.0f min",
+                inc.id, inc.severity.value, inc.title,
+                inc.age_minutes - inc.sla_tier.value,
+            )
+        return breached
+
+    def escalation_candidates(self) -> list[Incident]:
+        """Return open incidents within 5 minutes of SLA breach for proactive escalation."""
+        return [
+            i for i in self._incidents.values()
+            if i.resolved_at is None
+            and 0 < i.time_to_sla_breach_min <= 5
+        ]
+
+    @property
+    def open_incidents(self) -> list[Incident]:
+        return [i for i in self._incidents.values() if i.resolved_at is None]
+
+    @staticmethod
+    def _map_severity_to_sla(severity: Severity) -> SLATier:
+        return {
+            Severity.CRITICAL: SLATier.P1,
+            Severity.HIGH:     SLATier.P2,
+            Severity.MEDIUM:   SLATier.P3,
+            Severity.LOW:      SLATier.P4,
+        }[severity]
+
+
+# ── Release Tracker ───────────────────────────────────────────────────────────
+
+class ReleaseTracker:
+    """Tracks code releases to production and monitors post-release stability."""
+
+    def __init__(self):
+        self._releases: list[dict] = []
+
+    def record_release(self, system: str, version: str, deployer: str) -> dict:
+        release = {
+            "system":      system,
+            "version":     version,
+            "deployer":    deployer,
+            "deployed_at": utcnow().isoformat(),
+            "status":      "DEPLOYED",
+            "post_release_issues": [],
+        }
+        self._releases.append(release)
+        log.info("RELEASE | %s v%s deployed by %s", system, version, deployer)
+        return release
+
+    def flag_post_release_issue(self, system: str, issue: str):
+        for rel in reversed(self._releases):
+            if rel["system"] == system:
+                rel["post_release_issues"].append(issue)
+                rel["status"] = "DEGRADED"
+                log.warning("POST-RELEASE ISSUE | %s | %s", system, issue)
+                return
+        log.error("No release record found for system: %s", system)
+
+    def summary(self) -> list[dict]:
+        return self._releases
+
+
+# ── Reporting ─────────────────────────────────────────────────────────────────
+
+class ReportGenerator:
+    """Produces shift-handover and stakeholder reports automatically."""
+
+    def generate_shift_report(
+        self,
+        feeds: list[Feed],
+        health: list[ServiceHealth],
+        incidents: list[Incident],
+        releases: list[dict],
+        timezone: str = "AMRS",
+    ) -> str:
+        now = utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        open_incs = [i for i in incidents if i.resolved_at is None]
+        resolved   = [i for i in incidents if i.resolved_at is not None]
+        sla_breach_count = sum(1 for i in resolved if i.sla_breached)
+
+        problem_feeds = [f for f in feeds if f.status != FeedStatus.OK]
+        bad_services  = [s for s in health if not s.healthy]
+
+        lines = [
+            f"{'='*60}",
+            f"  RISK APPLICATION SUPPORT — SHIFT HANDOVER ({timezone})",
+            f"  Generated: {now}",
+            f"{'='*60}",
+            "",
+            "FEED STATUS",
+            f"  Total feeds monitored : {len(feeds)}",
+            f"  Feeds OK              : {len(feeds) - len(problem_feeds)}",
+            f"  Problem feeds         : {len(problem_feeds)}",
+        ]
+        for f in problem_feeds:
+            lines.append(f"    [{f.status.value:8s}] {f.name} ({f.system})")
+
+        lines += [
+            "",
+            "SERVICE HEALTH",
+            f"  Services checked      : {len(health)}",
+            f"  Healthy               : {len(health) - len(bad_services)}",
+            f"  Degraded/Down         : {len(bad_services)}",
+        ]
+        for s in bad_services:
+            lines.append(f"    [DOWN] {s.name} — {s.error}")
+
+        lines += [
+            "",
+            "INCIDENTS",
+            f"  Open                  : {len(open_incs)}",
+            f"  Resolved this shift   : {len(resolved)}",
+            f"  SLA breaches          : {sla_breach_count}",
+        ]
+        for i in open_incs:
+            lines.append(
+                f"    {i.id} [{i.severity.value:8s}] {i.title} "
+                f"(age: {i.age_minutes:.0f}m, SLA: {i.sla_tier.value}m)"
+            )
+
+        lines += [
+            "",
+            "RELEASES",
+            f"  Deployments this shift: {len(releases)}",
+        ]
+        for r in releases:
+            issue_flag = " ⚠ POST-RELEASE ISSUES" if r["post_release_issues"] else ""
+            lines.append(f"    {r['system']} v{r['version']} — {r['status']}{issue_flag}")
+
+        lines += ["", "=" * 60]
+        return "\n".join(lines)
+
+    def generate_metrics_json(
+        self,
+        incidents: list[Incident],
+    ) -> str:
+        by_severity: dict[str, list] = defaultdict(list)
+        for i in incidents:
+            by_severity[i.severity.value].append(i.age_minutes)
+
+        metrics = {
+            "generated_at": utcnow().isoformat(),
+            "total_incidents": len(incidents),
+            "open": sum(1 for i in incidents if i.resolved_at is None),
+            "sla_breaches": sum(1 for i in incidents if i.sla_breached),
+            "avg_resolution_min": (
+                round(
+                    sum(i.age_minutes for i in incidents if i.resolved_at) /
+                    max(1, sum(1 for i in incidents if i.resolved_at)),
+                    1,
+                )
+            ),
+            "by_severity": {
+                sev: {
+                    "count": len(ages),
+                    "avg_age_min": round(sum(ages) / len(ages), 1),
+                }
+                for sev, ages in by_severity.items()
+            },
+        }
+        return json.dumps(metrics, indent=2)
+
+
+# ── Main Monitoring Loop ───────────────────────────────────────────────────────
+
+def run_monitoring_cycle(cycles: int = 3, cycle_sleep_sec: float = 1.0):
+    """
+    Runs N monitoring cycles to demonstrate the automation workflow.
+    In production this would run as a daemon or scheduled job.
+    """
+    log.info("Starting Risk Application Monitoring — %d cycles", cycles)
+
+    feed_monitor     = FeedMonitor()
+    health_checker   = ServiceHealthChecker()
+    incident_manager = IncidentManager()
+    release_tracker  = ReleaseTracker()
+    reporter         = ReportGenerator()
+
+    # Simulate a deployment at start of shift
+    release_tracker.record_release("RiskEngine-API", "4.12.1", "ops-team")
+    release_tracker.record_release("TradedProductsUI", "2.8.0", "dev-team")
+
+    all_incidents: list[Incident] = []
+
+    for cycle in range(1, cycles + 1):
+        log.info("── Cycle %d/%d ──────────────────────────────────", cycle, cycles)
+
+        # 1. Poll feeds
+        feeds = feed_monitor.simulate_feed_poll()
+        problem_feeds = feed_monitor.get_problem_feeds()
+
+        for feed in problem_feeds:
+            feed_monitor.auto_remediate(feed)
+            # Escalate to incident if MISSING and auto-remediation already attempted
+            if feed.status == FeedStatus.MISSING:
+                severity = (
+                    Severity.CRITICAL if "Regulatory" in feed.system
+                    else Severity.HIGH
+                )
+                inc = incident_manager.open(
+                    f"Feed missing: {feed.name}",
+                    feed.system,
+                    severity,
+                )
+                all_incidents.append(inc)
+
+        # 2. Check service health
+        health_results = health_checker.check_all()
+        for svc in health_checker.degraded_services(health_results):
+            log.error("SERVICE DOWN | %s | %s | latency=%.0fms", svc.name, svc.error, svc.response_ms)
+            inc = incident_manager.open(
+                f"Service degraded: {svc.name}",
+                svc.name,
+                Severity.HIGH,
+            )
+            all_incidents.append(inc)
+            # Simulate post-release correlation
+            release_tracker.flag_post_release_issue(svc.name, svc.error or "Unknown error")
+
+        # 3. SLA checks
+        incident_manager.check_sla_breaches()
+        for escalation in incident_manager.escalation_candidates():
+            log.warning(
+                "PRE-BREACH ESCALATION | %s approaching SLA in %.0f min",
+                escalation.id, escalation.time_to_sla_breach_min,
+            )
+
+        # 4. Auto-resolve some incidents (simulate fixes arriving)
+        for inc in list(incident_manager.open_incidents)[:2]:
+            incident_manager.resolve(inc.id, "Automated remediation / feed reload successful")
+
+        time.sleep(cycle_sleep_sec)
+
+    # ── End-of-shift report ───────────────────────────────────────────────────
+    final_feeds   = feed_monitor.simulate_feed_poll()
+    final_health  = health_checker.check_all()
+    seen = {}
+    for i in all_incidents:
+        seen[i.id] = i
+    all_incidents = list(seen.values())
+
+    report = reporter.generate_shift_report(
+        final_feeds,
+        final_health,
+        all_incidents,
+        release_tracker.summary(),
+        timezone="AMRS",
+    )
+    print("\n" + report)
+
+    metrics_json = reporter.generate_metrics_json(all_incidents)
+    print("\nMETRICS JSON (for dashboards / ITSM integration):")
+    print(metrics_json)
+
+    log.info("Monitoring cycle complete.")
+
+
+# ── Entry Point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    run_monitoring_cycle(cycles=3, cycle_sleep_sec=0.5)
